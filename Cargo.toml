@@ -1,0 +1,11 @@
+[package]
+name = "HMI-Robot-Software"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.27" # o la versión que estés usando
+egui = "0.27"
+egui_plot = "0.27"
+serialport = "4.2"
+chrono = "0.4"
