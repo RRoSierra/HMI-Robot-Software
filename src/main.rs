@@ -113,7 +113,7 @@ impl Default for SysmicHmi {
             active_kin_sp: [0.0; 3],
             
             wheel_angles: [40.0, 140.0, 210.0, 330.0],
-            wheel_map: [0, 1, 2, 3], 
+            wheel_map: [1, 2, 3, 0], 
 
             last_tx_time: 0.0,
             
@@ -359,15 +359,32 @@ impl eframe::App for SysmicHmi {
         ctx.set_style(style);
 
         // --- CABECERA ---
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.heading(
-                    egui::RichText::new("SYSMIC ROBOTICS - SSL RUST HMI")
-                        .color(COLOR_SYSMIC_BLUE).size(24.0).strong(),
+        egui::TopBottomPanel::top("header")
+            .exact_height(80.0) // Expandimos la cabecera
+            .show(ctx, |ui| {
+            // Alineación centrada verticalmente para todo el contenido
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add_space(10.0);
+                
+                // 1. Logo bien escalado
+                ui.add(
+                    egui::Image::new(egui::include_image!("../logo.png"))
+                        .max_height(60.0) 
                 );
                 
+                ui.add_space(15.0);
+                
+                // 2. Título gigante y profesional
+                ui.label(
+                    egui::RichText::new("Robot SSL Human-Machine Interface")
+                        .color(COLOR_SYSMIC_BLUE)
+                        .size(28.0)
+                        .strong()
+                );
+                
+                // 3. Controles a la derecha (Botones de conexión)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(10.0);
                     if self.connected_port.is_none() {
                         if ui.button("Conectar USB").clicked() { self.connect_serial(); }
                         if ui.button("↻").clicked() { self.refresh_ports(); }
@@ -396,7 +413,6 @@ impl eframe::App for SysmicHmi {
                     }
                 });
             });
-            ui.add_space(10.0);
         });
 
         // --- PANEL INFERIOR (ACTUACIÓN Y CONFIGURACIÓN) ---
@@ -696,6 +712,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Sysmic HMI",
         options,
-        Box::new(|_cc| Box::new(SysmicHmi::default())),
+        Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Box::new(SysmicHmi::default())
+        }),
     )
 }

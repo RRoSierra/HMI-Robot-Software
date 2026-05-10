@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.27" # o la versión que estés usando
-egui = "0.27"
-egui_plot = "0.27"
+eframe = "0.27.2" # o la versión que estés usando
+egui = "0.27.2"
+egui_plot = "0.27.2"
 serialport = "4.2"
 chrono = "0.4"
+egui_extras = { version = "0.27", features = ["all_loaders"] }
+# Agrega el motor decodificador de PNG:
+image = { version = "0.24", features = ["png", "jpeg"] }
