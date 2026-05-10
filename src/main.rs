@@ -247,39 +247,38 @@ impl eframe::App for SysmicHmi {
             }
 
             while let Ok(msg) = rx.try_recv() {
-                if let SerialMessage::Telemetry(angles) = msg {
+                let SerialMessage::Telemetry(angles) = msg;
+                
+                self.telemetry_time_counter += STM32_SAMPLE_TIME; 
+                
+                for i in 0..4 {
+                    let mut delta_ticks = angles[i] as f64 - self.last_angles[i] as f64;
                     
-                    self.telemetry_time_counter += STM32_SAMPLE_TIME; 
+                    if delta_ticks >  32768.0 { delta_ticks -= 65536.0; }
+                    if delta_ticks < -32768.0 { delta_ticks += 65536.0; }
+
+                    let raw_vel = delta_ticks * (2.0 * PI / ENCODER_RESOLUTION) / STM32_SAMPLE_TIME;
+
+                    self.raw_vel_buffer[i].remove(0);
+                    self.raw_vel_buffer[i].push(raw_vel);
                     
-                    for i in 0..4 {
-                        let mut delta_ticks = angles[i] as f64 - self.last_angles[i] as f64;
-                        
-                        if delta_ticks >  32768.0 { delta_ticks -= 65536.0; }
-                        if delta_ticks < -32768.0 { delta_ticks += 65536.0; }
+                    let mut sorted_buf = self.raw_vel_buffer[i].clone();
+                    sorted_buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let median_vel = sorted_buf[2]; 
 
-                        let raw_vel = delta_ticks * (2.0 * PI / ENCODER_RESOLUTION) / STM32_SAMPLE_TIME;
+                    self.current_vels[i] = (FILTER_ALPHA * median_vel) + ((1.0 - FILTER_ALPHA) * self.current_vels[i]);
 
-                        self.raw_vel_buffer[i].remove(0);
-                        self.raw_vel_buffer[i].push(raw_vel);
-                        
-                        let mut sorted_buf = self.raw_vel_buffer[i].clone();
-                        sorted_buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        let median_vel = sorted_buf[2]; 
+                    self.vel_history[i].push([self.telemetry_time_counter, self.current_vels[i]]);
+                    if self.vel_history[i].len() > MAX_DATA_POINTS { self.vel_history[i].remove(0); }
+                }
+                self.last_angles = angles;
 
-                        self.current_vels[i] = (FILTER_ALPHA * median_vel) + ((1.0 - FILTER_ALPHA) * self.current_vels[i]);
-
-                        self.vel_history[i].push([self.telemetry_time_counter, self.current_vels[i]]);
-                        if self.vel_history[i].len() > MAX_DATA_POINTS { self.vel_history[i].remove(0); }
-                    }
-                    self.last_angles = angles;
-
-                    if self.is_recording {
-                        self.recorded_data.push([
-                            self.telemetry_time_counter, 
-                            self.current_vels[0], self.current_vels[1], self.current_vels[2], self.current_vels[3],
-                            self.current_actuations[0], self.current_actuations[1], self.current_actuations[2], self.current_actuations[3]
-                        ]);
-                    }
+                if self.is_recording {
+                    self.recorded_data.push([
+                        self.telemetry_time_counter, 
+                        self.current_vels[0], self.current_vels[1], self.current_vels[2], self.current_vels[3],
+                        self.current_actuations[0], self.current_actuations[1], self.current_actuations[2], self.current_actuations[3]
+                    ]);
                 }
             }
         }
