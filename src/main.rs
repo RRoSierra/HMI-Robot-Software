@@ -13,10 +13,14 @@ use std::time::{Duration, Instant};
 // ==========================================
 const MAX_DATA_POINTS: usize = 150;
 const ENCODER_RESOLUTION: f64 = 8192.0;
+const STM32_SAMPLE_TIME: f64 = 0.02; // 20ms exactos (50Hz)
 
-// Parámetros físicos del robot (basado en el PDF de Sysmic)
-const ROBOT_RADIUS: f64 = 0.08215; // en metros
-const WHEEL_RADIUS: f64 = 0.02704; // en metros
+// Filtro Pasa-Bajos (EMA)
+const FILTER_ALPHA: f64 = 0.35; 
+
+// Parámetros físicos del robot
+const ROBOT_RADIUS: f64 = 0.08215; // metros
+const WHEEL_RADIUS: f64 = 0.02704; // metros
 
 // Paleta Sysmic
 const COLOR_BG: Color32 = Color32::from_rgb(8, 10, 15);
@@ -24,10 +28,10 @@ const COLOR_PANEL: Color32 = Color32::from_rgb(30, 34, 46);
 const COLOR_SYSMIC_BLUE: Color32 = Color32::from_rgb(0, 168, 232);
 const COLOR_TEXT: Color32 = Color32::from_rgb(226, 232, 240);
 const CHART_COLORS: [Color32; 4] = [
-    Color32::from_rgb(0, 168, 232),   // M1: Azul Sysmic
-    Color32::from_rgb(0, 255, 204),   // M2: Cyan
-    Color32::from_rgb(255, 176, 0),   // M3: Naranja/Amarillo
-    Color32::from_rgb(255, 51, 102),  // M4: Magenta
+    Color32::from_rgb(0, 168, 232),   // M1
+    Color32::from_rgb(0, 255, 204),   // M2
+    Color32::from_rgb(255, 176, 0),   // M3
+    Color32::from_rgb(255, 51, 102),  // M4
 ];
 
 // ==========================================
@@ -45,23 +49,33 @@ enum SerialMessage {
 
 struct SysmicHmi {
     start_time: Instant,
-    last_time: f64,
     
     // --- HISTORIALES Y LECTURAS ---
-    vel_history: [Vec<[f64; 2]>; 4],  // Mediciones del Encoder (rad/s)
-    act_history: [Vec<[f64; 2]>; 4],  // Actuaciones enviadas (DAC o rad/s)
+    vel_history: [Vec<[f64; 2]>; 4],  
+    act_history: [Vec<[f64; 2]>; 4],  
     current_vels: [f64; 4],
     current_actuations: [f64; 4],
     last_angles: [u16; 4],
+
+    // --- FILTROS Y TIEMPO VIRTUAL ---
+    raw_vel_buffer: [Vec<f64>; 4],
+    telemetry_time_counter: f64,
     
     // --- ESTADO DE ACTUACIÓN Y CONFIGURACIÓN ---
     control_mode: ControlMode,
-    manual_sp: [i16; 4], 
-    kin_sp: [f64; 3],    // [Vx, Vy, Vw]
+    instant_update: bool, // true = Continuo, false = Disparo/Escalón
+    
+    // Sliders UI (Memoria visual)
+    slider_manual_sp: [i16; 4], 
+    slider_kin_sp: [f64; 3],    
+    
+    // Setpoints Activos (Los que realmente se envían)
+    active_manual_sp: [i16; 4],
+    active_kin_sp: [f64; 3],
     
     // Cinemática Dinámica
-    wheel_angles: [f64; 4], // Ángulos de las 4 ruedas lógicas
-    wheel_map: [usize; 4],  // Mapeo: wheel_map[RuedaLógica] = MotorFísico (0..3)
+    wheel_angles: [f64; 4], 
+    wheel_map: [usize; 4],  
 
     last_tx_time: f64,   
     
@@ -74,26 +88,32 @@ struct SysmicHmi {
 
     // Logs
     is_recording: bool,
-    recorded_data: Vec<[f64; 9]>, // [t, vel1..4, act1..4]
+    recorded_data: Vec<[f64; 9]>, 
 }
 
 impl Default for SysmicHmi {
     fn default() -> Self {
         let mut app = Self {
             start_time: Instant::now(),
-            last_time: 0.0,
             vel_history: [vec![], vec![], vec![], vec![]],
             act_history: [vec![], vec![], vec![], vec![]],
             current_vels: [0.0; 4],
             current_actuations: [0.0; 4],
             last_angles: [0; 4],
             
+            raw_vel_buffer: [vec![0.0; 5], vec![0.0; 5], vec![0.0; 5], vec![0.0; 5]], 
+            telemetry_time_counter: 0.0,
+
             control_mode: ControlMode::Manual,
-            manual_sp: [0; 4],
-            kin_sp: [0.0; 3],
+            instant_update: true,
             
-            wheel_angles: [60.0, 130.0, 230.0, 300.0],
-            wheel_map: [0, 1, 2, 3], // Rueda Lógica i -> Motor Físico i
+            slider_manual_sp: [0; 4],
+            slider_kin_sp: [0.0; 3],
+            active_manual_sp: [0; 4],
+            active_kin_sp: [0.0; 3],
+            
+            wheel_angles: [40.0, 140.0, 210.0, 330.0],
+            wheel_map: [0, 1, 2, 3], 
 
             last_tx_time: 0.0,
             
@@ -126,9 +146,11 @@ impl SysmicHmi {
     fn connect_serial(&mut self) {
         if self.selected_port.is_empty() { return; }
         self.last_angles = [0; 4];
-        self.last_time = self.start_time.elapsed().as_secs_f64() - 1.0;
         self.current_vels = [0.0; 4];
         self.current_actuations = [0.0; 4];
+        self.raw_vel_buffer = [vec![0.0; 5], vec![0.0; 5], vec![0.0; 5], vec![0.0; 5]];
+        self.telemetry_time_counter = self.start_time.elapsed().as_secs_f64();
+
         for h in &mut self.vel_history { h.clear(); }
         for h in &mut self.act_history { h.clear(); }
 
@@ -151,12 +173,10 @@ impl SysmicHmi {
             let mut read_buf = [0u8; 1024];
 
             loop {
-                // --- TX: enviar tramas al MCU ---
                 while let Ok(packet) = cmd_rx.try_recv() {
                     if port.write_all(&packet).is_err() { return; }
                 }
 
-                // --- RX: leer bytes ---
                 match port.read(&mut read_buf) {
                     Ok(t) if t > 0 => buffer.extend_from_slice(&read_buf[..t]),
                     Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => (),
@@ -164,7 +184,6 @@ impl SysmicHmi {
                     _ => (),
                 }
 
-                // --- Parser de Telemetría (0xAA 0xBB ... 0x0A) ---
                 'parse: loop {
                     if buffer.len() < 2 { break 'parse; }
 
@@ -196,8 +215,10 @@ impl SysmicHmi {
         self.rx_channel = None;
         self.tx_channel = None;
         self.connected_port = None;
-        self.manual_sp = [0; 4];
-        self.kin_sp = [0.0; 3];
+        self.slider_manual_sp = [0; 4];
+        self.slider_kin_sp = [0.0; 3];
+        self.active_manual_sp = [0; 4];
+        self.active_kin_sp = [0.0; 3];
     }
 
     fn save_recording_csv(&mut self) {
@@ -218,42 +239,43 @@ impl eframe::App for SysmicHmi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t = self.start_time.elapsed().as_secs_f64();
 
-        // 1. RECEPCIÓN DE DATOS (RX - SOLO SI ESTÁ CONECTADO)
+        // 1. RECEPCIÓN DE DATOS (RX) - PROCESAMIENTO SECUENCIAL ESTRICTO
         if let Some(rx) = &self.rx_channel {
-            let mut new_telemetry = false;
-            let mut latest_angles = [0u16; 4];
-
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    SerialMessage::Telemetry(angles) => {
-                        latest_angles = angles;
-                        new_telemetry = true;
-                    }
-                }
+            
+            if (self.telemetry_time_counter - t).abs() > 1.0 {
+                self.telemetry_time_counter = t;
             }
 
-            if new_telemetry {
-                let dt = t - self.last_time;
-                if dt > 0.5 {
-                    self.last_angles = latest_angles;
-                    self.last_time = t;
-                } else if dt > 0.001 {
+            while let Ok(msg) = rx.try_recv() {
+                if let SerialMessage::Telemetry(angles) = msg {
+                    
+                    self.telemetry_time_counter += STM32_SAMPLE_TIME; 
+                    
                     for i in 0..4 {
-                        let mut delta_ticks = latest_angles[i] as f64 - self.last_angles[i] as f64;
-                        if delta_ticks >  ENCODER_RESOLUTION / 2.0 { delta_ticks -= ENCODER_RESOLUTION; }
-                        if delta_ticks < -ENCODER_RESOLUTION / 2.0 { delta_ticks += ENCODER_RESOLUTION; }
+                        let mut delta_ticks = angles[i] as f64 - self.last_angles[i] as f64;
+                        
+                        if delta_ticks >  32768.0 { delta_ticks -= 65536.0; }
+                        if delta_ticks < -32768.0 { delta_ticks += 65536.0; }
 
-                        self.current_vels[i] = delta_ticks * (2.0 * PI / ENCODER_RESOLUTION) / dt;
+                        let raw_vel = delta_ticks * (2.0 * PI / ENCODER_RESOLUTION) / STM32_SAMPLE_TIME;
 
-                        self.vel_history[i].push([t, self.current_vels[i]]);
+                        self.raw_vel_buffer[i].remove(0);
+                        self.raw_vel_buffer[i].push(raw_vel);
+                        
+                        let mut sorted_buf = self.raw_vel_buffer[i].clone();
+                        sorted_buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let median_vel = sorted_buf[2]; 
+
+                        self.current_vels[i] = (FILTER_ALPHA * median_vel) + ((1.0 - FILTER_ALPHA) * self.current_vels[i]);
+
+                        self.vel_history[i].push([self.telemetry_time_counter, self.current_vels[i]]);
                         if self.vel_history[i].len() > MAX_DATA_POINTS { self.vel_history[i].remove(0); }
                     }
-                    self.last_angles = latest_angles;
-                    self.last_time = t;
+                    self.last_angles = angles;
 
                     if self.is_recording {
                         self.recorded_data.push([
-                            t, 
+                            self.telemetry_time_counter, 
                             self.current_vels[0], self.current_vels[1], self.current_vels[2], self.current_vels[3],
                             self.current_actuations[0], self.current_actuations[1], self.current_actuations[2], self.current_actuations[3]
                         ]);
@@ -265,16 +287,21 @@ impl eframe::App for SysmicHmi {
         // --- CÁLCULO DE ACTUACIONES Y CINEMÁTICA ---
         let mut target_phys_actuations = [0.0; 4];
 
+        // Lógica de Transferencia Continuo/Disparo
+        if self.instant_update {
+            self.active_manual_sp = self.slider_manual_sp;
+            self.active_kin_sp = self.slider_kin_sp;
+        }
+
         if self.control_mode == ControlMode::Manual {
             for logical_i in 0..4 {
                 let phys_i = self.wheel_map[logical_i];
-                target_phys_actuations[phys_i] = self.manual_sp[logical_i] as f64;
+                target_phys_actuations[phys_i] = self.active_manual_sp[logical_i] as f64;
             }
         } else {
-            // Cinemática Inversa calculada en PC
-            let vx = self.kin_sp[0];
-            let vy = self.kin_sp[1];
-            let vw = self.kin_sp[2];
+            let vx = self.active_kin_sp[0];
+            let vy = self.active_kin_sp[1];
+            let vw = self.active_kin_sp[2];
             
             for logical_i in 0..4 {
                 let a = self.wheel_angles[logical_i] * PI / 180.0;
@@ -288,19 +315,18 @@ impl eframe::App for SysmicHmi {
         self.current_actuations = target_phys_actuations;
 
 
-        // --- BUCLE DE 50 Hz (Transmisión a STM32 o Simulación Offline) ---
-        if t - self.last_tx_time > 0.02 { 
-            self.last_tx_time = t;
-            
-            if self.connected_port.is_some() {
-                // ONLINE: Guardar historial de actuación y Enviar por Serial
+        // --- TRANSMISIÓN PERIÓDICA AL STM32 (TX a ~50 Hz) ---
+        if self.connected_port.is_some() {
+            if t - self.last_tx_time > 0.02 { 
+                self.last_tx_time = t;
+                
                 for i in 0..4 {
                     self.act_history[i].push([t, self.current_actuations[i]]);
                     if self.act_history[i].len() > MAX_DATA_POINTS { self.act_history[i].remove(0); }
                 }
 
-                let mut packet = vec![0xAA];
-                packet.push(self.control_mode as u8);
+                let mut packet = vec![0xAA]; 
+                packet.push(self.control_mode as u8); 
                 
                 for i in 0..4 {
                     let val = if self.control_mode == ControlMode::Manual {
@@ -316,35 +342,14 @@ impl eframe::App for SysmicHmi {
                 let mut chk = 0u8;
                 for b in &packet[1..] { chk = chk.wrapping_add(*b); }
                 packet.push(chk);
-                packet.push(0x0A);
+                packet.push(0x0A); 
                 
                 if let Some(tx) = &self.tx_channel {
                     let _ = tx.send(packet);
                 }
-            } else {
-                // OFFLINE: Simular el comportamiento del Robot (Gemelo Digital)
-                for i in 0..4 {
-                    // Si estamos en manual (DAC), lo escalamos a un rad/s aproximado (ej: max 30 rad/s)
-                    // Si es cinemático, la actuación ya viene en rad/s
-                    let simulated_vel = if self.control_mode == ControlMode::Manual {
-                        self.current_actuations[i] * (30.0 / 4095.0) 
-                    } else {
-                        self.current_actuations[i]
-                    };
-                    
-                    self.current_vels[i] = simulated_vel;
-                    
-                    // Llenar historiales de medición y actuación
-                    self.vel_history[i].push([t, self.current_vels[i]]);
-                    if self.vel_history[i].len() > MAX_DATA_POINTS { self.vel_history[i].remove(0); }
-                    
-                    self.act_history[i].push([t, self.current_actuations[i]]);
-                    if self.act_history[i].len() > MAX_DATA_POINTS { self.act_history[i].remove(0); }
-                }
             }
         }
 
-        // Bucle continuo para el HMI
         ctx.request_repaint();
 
         // 2. ESTILOS UI
@@ -373,7 +378,7 @@ impl eframe::App for SysmicHmi {
                                     ui.selectable_value(&mut self.selected_port, p.clone(), p);
                                 }
                             });
-                        ui.label(egui::RichText::new("⬛ Desconectado (Modo Simulación)").color(Color32::from_gray(160)).strong());
+                        ui.label(egui::RichText::new("⬛ Desconectado").color(Color32::from_gray(160)).strong());
                     } else {
                         if ui.button("Desconectar").clicked() { self.disconnect_serial(); }
                         let rec_text = if self.is_recording { "⏹ Detener Grabación" } else { "⏺ Grabar CSV" };
@@ -396,7 +401,7 @@ impl eframe::App for SysmicHmi {
 
         // --- PANEL INFERIOR (ACTUACIÓN Y CONFIGURACIÓN) ---
         egui::TopBottomPanel::bottom("control_panel")
-            .exact_height(180.0) 
+            .exact_height(260.0) 
             .show(ctx, |ui| {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -408,153 +413,201 @@ impl eframe::App for SysmicHmi {
                         ui.radio_value(&mut self.control_mode, ControlMode::Manual, "Modo Manual (DAC Directo)");
                         ui.radio_value(&mut self.control_mode, ControlMode::Kinematic, "Modo Cinemático (IK en PC)");
                         
-                        ui.add_space(15.0);
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("TIPO DE ACTUALIZACIÓN").color(COLOR_SYSMIC_BLUE).strong());
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.instant_update, true, "Continuo");
+                            ui.radio_value(&mut self.instant_update, false, "Disparo");
+                        });
+
+                        ui.add_space(10.0);
                         let stop_btn = egui::Button::new(
-                            egui::RichText::new("🛑 PARADA DE EMERGENCIA").color(Color32::WHITE).size(15.0).strong()
+                            egui::RichText::new("🛑 STOP / EMERGENCIA").color(Color32::WHITE).size(14.0).strong()
                         ).fill(Color32::from_rgb(200, 0, 0));
                         
-                        if ui.add_sized([200.0, 40.0], stop_btn).clicked() {
-                            self.manual_sp = [0; 4];
-                            self.kin_sp = [0.0; 3];
+                        if ui.add_sized([200.0, 30.0], stop_btn).clicked() {
+                            self.slider_manual_sp = [0; 4];
+                            self.slider_kin_sp = [0.0; 3];
+                            self.active_manual_sp = [0; 4];
+                            self.active_kin_sp = [0.0; 3];
                         }
                     });
 
                     ui.separator();
 
-                    // Columna 2: Dinámica según el modo
-                    match self.control_mode {
-                        ControlMode::Manual => {
-                            ui.vertical(|ui| {
+                    // Columna 2: Sliders de Actuación
+                    ui.vertical(|ui| {
+                        ui.set_width(260.0);
+                        match self.control_mode {
+                            ControlMode::Manual => {
                                 ui.label(egui::RichText::new("SETPOINTS MANUALES (-4095 a +4095)").strong());
-                                ui.add_space(10.0);
                                 ui.horizontal(|ui| {
                                     for i in 0..4 {
                                         ui.vertical(|ui| {
-                                            ui.label(format!("R. Lógica {}", i + 1));
-                                            ui.add(egui::Slider::new(&mut self.manual_sp[i], -4095..=4095).orientation(egui::SliderOrientation::Vertical));
-                                            if ui.button("0").clicked() { self.manual_sp[i] = 0; }
+                                            ui.label(format!("R. {}", i + 1));
+                                            ui.add(egui::Slider::new(&mut self.slider_manual_sp[i], -4095..=4095).orientation(egui::SliderOrientation::Vertical));
+                                            
+                                            ui.add_space(5.0);
+                                            
+                                            // Botón para volver a 0 (No inyecta si está en modo Disparo)
+                                            if ui.button("0").clicked() { 
+                                                self.slider_manual_sp[i] = 0; 
+                                                if self.instant_update { self.active_manual_sp[i] = 0; }
+                                            }
+
+                                            // Botón "Rayo" Individual (Solo aparece en modo Disparo)
+                                            if !self.instant_update {
+                                                ui.add_space(2.0);
+                                                let inject_mini_btn = egui::Button::new(
+                                                    egui::RichText::new("⚡").color(Color32::BLACK)
+                                                ).fill(Color32::from_rgb(255, 215, 0));
+                                                
+                                                if ui.add(inject_mini_btn).on_hover_text("Inyectar escalón solo a este motor").clicked() {
+                                                    self.active_manual_sp[i] = self.slider_manual_sp[i];
+                                                }
+                                            }
                                         });
-                                        ui.add_space(15.0);
+                                        ui.add_space(8.0);
                                     }
                                 });
-                            });
-                        },
-                        ControlMode::Kinematic => {
-                            ui.vertical(|ui| {
-                                ui.set_width(220.0);
+                            },
+                            ControlMode::Kinematic => {
                                 ui.label(egui::RichText::new("SETPOINTS CINEMÁTICOS").strong());
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
                                     ui.label("Vx (Frontal):");
-                                    ui.add(egui::Slider::new(&mut self.kin_sp[0], -2.5..=2.5).text("m/s"));
-                                    if ui.button("0").clicked() { self.kin_sp[0] = 0.0; }
+                                    ui.add(egui::Slider::new(&mut self.slider_kin_sp[0], -10.0..=10.0).text("m/s"));
+                                    if ui.button("0").clicked() { 
+                                        self.slider_kin_sp[0] = 0.0; 
+                                        if self.instant_update { self.active_kin_sp[0] = 0.0; }
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Vy (Lateral): ");
-                                    ui.add(egui::Slider::new(&mut self.kin_sp[1], -2.5..=2.5).text("m/s"));
-                                    if ui.button("0").clicked() { self.kin_sp[1] = 0.0; }
+                                    ui.add(egui::Slider::new(&mut self.slider_kin_sp[1], -10.0..=10.0).text("m/s"));
+                                    if ui.button("0").clicked() { 
+                                        self.slider_kin_sp[1] = 0.0; 
+                                        if self.instant_update { self.active_kin_sp[1] = 0.0; }
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Vω (Giro):    ");
-                                    ui.add(egui::Slider::new(&mut self.kin_sp[2], -6.0..=6.0).text("rad/s"));
-                                    if ui.button("0").clicked() { self.kin_sp[2] = 0.0; }
+                                    ui.add(egui::Slider::new(&mut self.slider_kin_sp[2], -15.0..=15.0).text("rad/s"));
+                                    if ui.button("0").clicked() { 
+                                        self.slider_kin_sp[2] = 0.0; 
+                                        if self.instant_update { self.active_kin_sp[2] = 0.0; }
+                                    }
                                 });
-                            });
+                            }
+                        }
 
-                            ui.separator();
+                        // Botón de Disparo Global (Inyecta todo a la vez)
+                        if !self.instant_update {
+                            ui.add_space(10.0);
+                            let inject_btn = egui::Button::new(
+                                egui::RichText::new("⚡ INYECTAR ESCALÓN").color(Color32::BLACK).size(14.0).strong()
+                            ).fill(Color32::from_rgb(255, 215, 0));
+                            
+                            if ui.add_sized([250.0, 30.0], inject_btn).clicked() {
+                                self.active_manual_sp = self.slider_manual_sp;
+                                self.active_kin_sp = self.slider_kin_sp;
+                            }
+                        }
+                    });
 
-                            ui.vertical(|ui| {
-                                ui.set_width(180.0);
-                                ui.label(egui::RichText::new("ÁNGULOS DE RUEDA (°)").color(COLOR_SYSMIC_BLUE).strong());
-                                ui.add_space(5.0);
-                                for i in 0..4 {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("Rueda Lógica {}:", i + 1));
-                                        ui.add(egui::DragValue::new(&mut self.wheel_angles[i]).speed(1.0).clamp_range(0.0..=360.0));
-                                    });
-                                }
-                            });
+                    ui.separator();
 
-                            ui.separator();
-
-                            ui.vertical(|ui| {
-                                ui.set_width(220.0);
-                                ui.label(egui::RichText::new("MAPEO A HARDWARE").color(COLOR_SYSMIC_BLUE).strong());
-                                ui.add_space(5.0);
-                                for logical_i in 0..4 {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("Señal Lógica {} →", logical_i + 1));
-                                        egui::ComboBox::from_id_source(format!("map_{}", logical_i))
-                                            .selected_text(format!("Motor M{}", self.wheel_map[logical_i] + 1))
-                                            .width(90.0)
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut self.wheel_map[logical_i], 0, "Motor M1 (Azul)");
-                                                ui.selectable_value(&mut self.wheel_map[logical_i], 1, "Motor M2 (Cyan)");
-                                                ui.selectable_value(&mut self.wheel_map[logical_i], 2, "Motor M3 (Amarillo)");
-                                                ui.selectable_value(&mut self.wheel_map[logical_i], 3, "Motor M4 (Magenta)");
-                                            });
-                                    });
-                                }
+                    // Columna 3: Configuración de Ángulos
+                    ui.vertical(|ui| {
+                        ui.set_width(180.0);
+                        ui.label(egui::RichText::new("ÁNGULOS DE RUEDA (°)").color(COLOR_SYSMIC_BLUE).strong());
+                        ui.add_space(5.0);
+                        for i in 0..4 {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Rueda Lógica {}:", i + 1));
+                                ui.add(egui::DragValue::new(&mut self.wheel_angles[i]).speed(1.0).clamp_range(0.0..=360.0));
                             });
                         }
-                    }
+                    });
+
+                    ui.separator();
+
+                    // Columna 4: Mapeo de Ruedas Físicas
+                    ui.vertical(|ui| {
+                        ui.set_width(220.0);
+                        ui.label(egui::RichText::new("MAPEO A HARDWARE").color(COLOR_SYSMIC_BLUE).strong());
+                        ui.add_space(5.0);
+                        for logical_i in 0..4 {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Señal Lógica {} →", logical_i + 1));
+                                egui::ComboBox::from_id_source(format!("map_{}", logical_i))
+                                    .selected_text(format!("Motor M{}", self.wheel_map[logical_i] + 1))
+                                    .width(90.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.wheel_map[logical_i], 0, "Motor M1 (Azul)");
+                                        ui.selectable_value(&mut self.wheel_map[logical_i], 1, "Motor M2 (Cyan)");
+                                        ui.selectable_value(&mut self.wheel_map[logical_i], 2, "Motor M3 (Amarillo)");
+                                        ui.selectable_value(&mut self.wheel_map[logical_i], 3, "Motor M4 (Magenta)");
+                                    });
+                            });
+                        }
+                    });
+
                 });
             });
 
-        // --- PANEL IZQUIERDO (DOS COLUMNAS: ACTUACIONES Y MEDICIONES) ---
-        egui::SidePanel::left("graphs_panel")
+        // --- PANEL IZQUIERDO 1 (ACTUACIONES) ---
+        egui::SidePanel::left("actuations_panel")
             .resizable(true)
-            .default_width(640.0)
+            .default_width(320.0)
             .show(ctx, |ui| {
                 ui.add_space(10.0);
+                ui.label(egui::RichText::new("ACTUACIONES (SETPOINTS)").color(COLOR_SYSMIC_BLUE).strong().size(16.0));
+                ui.separator();
                 
-                ui.columns(2, |columns| {
-                    // COLUMNA 1: Actuaciones
-                    columns[0].vertical(|ui| {
-                        ui.label(egui::RichText::new("ACTUACIONES (SETPOINTS)").color(COLOR_SYSMIC_BLUE).strong().size(16.0));
-                        ui.separator();
-                        
-                        let unit = if self.control_mode == ControlMode::Manual { "DAC" } else { "rad/s" };
-                        
-                        for phys_i in 0..4 {
-                            ui.group(|ui| {
-                                ui.label(egui::RichText::new(format!("REFERENCIA M{} ({})", phys_i + 1, unit)).color(COLOR_TEXT).strong());
-                                let line = Line::new(PlotPoints::new(self.act_history[phys_i].clone())).color(CHART_COLORS[phys_i]).width(2.0);
+                let unit = if self.control_mode == ControlMode::Manual { "DAC" } else { "rad/s" };
+                
+                for phys_i in 0..4 {
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new(format!("REFERENCIA M{} ({})", phys_i + 1, unit)).color(COLOR_TEXT).strong());
+                        let line = Line::new(PlotPoints::new(self.act_history[phys_i].clone())).color(CHART_COLORS[phys_i]).width(2.0);
 
-                                Plot::new(format!("act_plot_{}", phys_i))
-                                    .height(100.0) 
-                                    .show_axes([false, true])
-                                    .allow_drag(false)
-                                    .allow_zoom(false)
-                                    .show(ui, |plot_ui| plot_ui.line(line));
-                            });
-                            ui.add_space(2.0);
-                        }
+                        Plot::new(format!("act_plot_{}", phys_i))
+                            .height(100.0) 
+                            .show_axes([false, true])
+                            .allow_drag(false)
+                            .allow_zoom(false)
+                            .show(ui, |plot_ui| plot_ui.line(line));
                     });
+                    ui.add_space(2.0);
+                }
+            });
 
-                    // COLUMNA 2: Mediciones
-                    columns[1].vertical(|ui| {
-                        ui.label(egui::RichText::new("MEDICIONES (ENCODERS)").color(Color32::GREEN).strong().size(16.0));
-                        ui.separator();
-                        
-                        for phys_i in 0..4 {
-                            ui.group(|ui| {
-                                ui.label(egui::RichText::new(format!("VELOCIDAD M{} (rad/s)", phys_i + 1)).color(COLOR_TEXT).strong());
-                                let line = Line::new(PlotPoints::new(self.vel_history[phys_i].clone())).color(CHART_COLORS[phys_i]).width(2.0);
+        // --- PANEL IZQUIERDO 2 (MEDICIONES) ---
+        egui::SidePanel::left("plots_panel")
+            .resizable(true)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("MEDICIONES (ENCODERS)").color(Color32::GREEN).strong().size(16.0));
+                ui.separator();
+                
+                for phys_i in 0..4 {
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new(format!("VELOCIDAD M{} (rad/s)", phys_i + 1)).color(COLOR_TEXT).strong());
+                        let line = Line::new(PlotPoints::new(self.vel_history[phys_i].clone())).color(CHART_COLORS[phys_i]).width(2.0);
 
-                                Plot::new(format!("vel_plot_{}", phys_i))
-                                    .height(100.0) 
-                                    .show_axes([false, true])
-                                    .include_y(30.0)
-                                    .include_y(-30.0)
-                                    .allow_drag(false)
-                                    .allow_zoom(false)
-                                    .show(ui, |plot_ui| plot_ui.line(line));
-                            });
-                            ui.add_space(2.0);
-                        }
+                        Plot::new(format!("vel_plot_{}", phys_i))
+                            .height(100.0) 
+                            .show_axes([false, true])
+                            .include_y(30.0)
+                            .include_y(-30.0)
+                            .allow_drag(false)
+                            .allow_zoom(false)
+                            .show(ui, |plot_ui| plot_ui.line(line));
                     });
-                });
+                    ui.add_space(2.0);
+                }
             });
 
         // --- PANEL CENTRAL (Vista 2D de la Base) ---
@@ -593,7 +646,6 @@ impl eframe::App for SysmicHmi {
                 (0.45, -0.45),  // M4 (Magenta)
             ];
 
-            // Dibujar los 4 círculos estáticos de los motores (Monturas internas)
             for phys_i in 0..4 {
                 let (cx, cy) = mount_points[phys_i];
                 painter.circle(to_screen(cx, cy), (0.15 * scale as f64) as f32, CHART_COLORS[phys_i], Stroke::new(2.0, Color32::BLACK));
@@ -601,16 +653,14 @@ impl eframe::App for SysmicHmi {
 
             // 4. Dibujar Llantas rotatorias y Vectores en el PERÍMETRO del chasis
             for logical_i in 0..4 {
-                let phys_i = self.wheel_map[logical_i]; // Obtener qué motor es
                 let angle_rad = self.wheel_angles[logical_i] * PI / 180.0;
+                let phys_i = self.wheel_map[logical_i]; 
                 let wheel_color = CHART_COLORS[phys_i]; 
                 
-                // El centro de la rueda se ubica dinámicamente en el borde (radio = 1.0 en coords relativas)
                 let x = angle_rad.cos();
                 let y = angle_rad.sin();
                 let wheel_center = to_screen(x, y);
                 
-                // Llanta (Línea/Rectángulo tangente al perímetro)
                 let tangent_dir = Vec2::new(-(angle_rad.sin() as f32), -(angle_rad.cos() as f32));
                 let wheel_length = scale as f32 * 0.4;
                 let p1 = wheel_center + tangent_dir * (wheel_length / 2.0);
@@ -619,9 +669,9 @@ impl eframe::App for SysmicHmi {
                 painter.line_segment([p1, p2], Stroke::new(14.0, Color32::from_rgb(17, 17, 17)));
                 painter.line_segment([p1, p2], Stroke::new(4.0, wheel_color));
 
-                // Vector de Velocidad (leemos la velocidad simulada o real)
+                // --- NORMALIZACIÓN DE FLECHAS ---
                 let vel = self.current_vels[phys_i];
-                let vec_scale = vel * 0.06; 
+                let vec_scale = vel * 0.006; 
                 
                 let force_x = (angle_rad + PI/2.0).cos() * vec_scale;
                 let force_y = (angle_rad + PI/2.0).sin() * vec_scale;
